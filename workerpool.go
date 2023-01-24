@@ -2,7 +2,6 @@ package workerpool
 
 import (
 	"context"
-	"log"
 	"sync"
 )
 
@@ -18,7 +17,7 @@ const (
 type StateFunc func(*WorkerPool, State)
 
 type WorkerPool struct {
-	*sync.Mutex
+	mutex        *sync.Mutex
 	ctx          context.Context
 	cancelFunc   context.CancelFunc
 	stopChan     chan struct{}
@@ -47,7 +46,7 @@ type Info struct {
 
 func NewWorkerPool(config *Config) *WorkerPool {
 	wp := &WorkerPool{
-		Mutex:        &sync.Mutex{},
+		mutex:        &sync.Mutex{},
 		stopChan:     make(chan struct{}, 1),
 		state:        StateStopped,
 		working:      []*worker{},
@@ -60,10 +59,12 @@ func NewWorkerPool(config *Config) *WorkerPool {
 }
 
 func (wp *WorkerPool) AddWorks(work ...Work) {
-	wp.Lock()
+	wp.mutex.Lock()
 	wp.workQueue = append(wp.workQueue, work...)
-	wp.assignWork()
-	wp.Unlock()
+	if wp.state == StateStarted {
+		wp.assignWork()
+	}
+	wp.mutex.Unlock()
 }
 
 func (wp *WorkerPool) updateConfig(config *Config) {
@@ -101,18 +102,21 @@ func (wp *WorkerPool) returnWorkerToIdle(worker *worker) {
 }
 
 func (wp *WorkerPool) finishedWork(work Work) {
-	log.Printf("Finished %v", work)
+	//log.Printf("Finished %+v", work)
 	wp.finished++
 }
 
 func (wp *WorkerPool) assignWork() {
-	doableWorks := wp.dequeDoableWorks()
-	idleWorkersToWork := wp.idle[len(doableWorks):]
-	for i, work := range doableWorks {
-		idleWorkersToWork[i].Start(wp.ctx, work)
+	doableWorks := wp.doableWorks()
+	if doableWorks > 0 {
+		works := wp.dequeWorks(doableWorks)
+		idleWorkersToWork := wp.idle[wp.idleWorkers()-doableWorks:]
+		for i, work := range works {
+			idleWorkersToWork[i].Start(wp.ctx, work)
+		}
+		wp.working = append(wp.working, idleWorkersToWork...)
+		wp.removeIdleWorkers(doableWorks)
 	}
-	wp.working = append(wp.working, idleWorkersToWork...)
-	wp.removeIdleWorkers(len(doableWorks))
 }
 
 func (wp *WorkerPool) createMissingWorkers() {
@@ -173,10 +177,9 @@ func (wp *WorkerPool) addIdleWorkers(n int) {
 	}
 }
 
-func (wp *WorkerPool) dequeDoableWorks() []Work {
-	doable := wp.doableWorks()
-	doableWorks := wp.workQueue[:doable]
-	wp.workQueue = wp.workQueue[doable:]
+func (wp *WorkerPool) dequeWorks(n int) []Work {
+	doableWorks := wp.workQueue[:n]
+	wp.workQueue = wp.workQueue[n:]
 	return doableWorks
 }
 
@@ -233,20 +236,20 @@ func (wp *WorkerPool) setState(state State) {
 // Start starts the worker pool and its workers, blocks until started.
 // If already started, returns immediately.
 func (wp *WorkerPool) Start() {
-	wp.Lock()
-	defer wp.Unlock()
+	wp.mutex.Lock()
 
-	if wp.state == StateStarted {
+	if wp.state != StateStopped {
+		wp.mutex.Unlock()
 		return
 	}
-
-	wp.setState(StateStarting)
 
 	wp.ctx, wp.cancelFunc = context.WithCancel(context.Background())
 
 	wp.updateWorkers()
 
 	go wp.listen()
+
+	wp.mutex.Unlock()
 
 	wp.setState(StateStarted)
 }
@@ -256,10 +259,10 @@ ListenLoop:
 	for {
 		select {
 		case finished := <-wp.finishedChan:
-			wp.Lock()
+			wp.mutex.Lock()
 			wp.finishedWork(finished.Work)
 			wp.finishedWorker(finished.Worker)
-			wp.Unlock()
+			wp.mutex.Unlock()
 		case <-wp.ctx.Done():
 			break ListenLoop
 		}
@@ -283,31 +286,31 @@ EmptyFinishedLoop:
 // Stop stops the worker pool and its workers, blocks until stopped.
 // If already stopped returns immediately.
 func (wp *WorkerPool) Stop() {
-	wp.Lock()
-	defer wp.Unlock()
+	wp.mutex.Lock()
 
 	if wp.state == StateStopped {
+		wp.mutex.Unlock()
 		return
 	}
-
-	wp.setState(StateStopping)
 
 	wp.cancelFunc()
 
 	<-wp.stopChan
 
+	wp.mutex.Unlock()
+
 	wp.setState(StateStopped)
 }
 
 func (wp *WorkerPool) SetConfig(config *Config) {
-	wp.Lock()
+	wp.mutex.Lock()
 	wp.updateConfig(config)
-	wp.Unlock()
+	wp.mutex.Unlock()
 }
 
 func (wp *WorkerPool) GetInfo() *Info {
-	wp.Lock()
-	defer wp.Unlock()
+	wp.mutex.Lock()
+	defer wp.mutex.Unlock()
 
 	return &Info{
 		MaxWorkers: wp.maxWorkers,
